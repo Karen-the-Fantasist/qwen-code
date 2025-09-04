@@ -10,7 +10,9 @@ import { IncomingMessage, ServerResponse } from 'node:http';
 import { Config } from '@qwen-code/qwen-code-core/dist/src/config/config.js';
 import { GeminiClient } from '@qwen-code/qwen-code-core/dist/src/core/client.js';
 import { AuthType, createContentGeneratorConfig } from '@qwen-code/qwen-code-core/dist/src/core/contentGenerator.js';
+import { executeToolCall } from '@qwen-code/qwen-code-core/dist/src/core/nonInteractiveToolExecutor.js';
 import { v4 as uuidv4 } from 'uuid';
+import { hostname } from 'node:os';
 
 // SSE stream helper
 function writeSSE(res: ServerResponse, data: string) {
@@ -41,12 +43,6 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
   // Handle POST requests to /v1/chat/completions
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     try {
-      // Set CORS headers
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      
       // Collect request body
       let body = '';
       req.on('data', chunk => {
@@ -113,6 +109,9 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
           const geminiClient = new GeminiClient(config);
           await geminiClient.initialize(contentGeneratorConfig);
           
+          // Get tool registry
+          const toolRegistry = await config.getToolRegistry();
+          
           // Send request and stream response
           try {
             if (stream) {
@@ -122,26 +121,90 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
               res.setHeader('Cache-Control', 'no-cache');
               res.setHeader('Connection', 'keep-alive');
               
-              const stream = await geminiClient.sendMessageStream(
+              const responseStream = await geminiClient.sendMessageStream(
                 [{ text: prompt }],
                 undefined, // abortSignal
                 'sse-request' // prompt_id
               );
               
               // Process stream and send SSE events
-              for await (const event of stream) {
-                if (event.type === 'content') {
-                  writeSSE(res, JSON.stringify({
-                    id: 'chatcmpl-' + Date.now(),
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: 'qwen-code',
-                    choices: [{
-                      index: 0,
-                      delta: { content: event.value },
-                      finish_reason: null
-                    }]
-                  }));
+              for await (const event of responseStream) {
+                switch (event.type) {
+                  case 'content':
+                    writeSSE(res, JSON.stringify({
+                      id: 'chatcmpl-' + Date.now(),
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: 'qwen-code',
+                      choices: [{
+                        index: 0,
+                        delta: { content: event.value },
+                        finish_reason: null
+                      }]
+                    }));
+                    break;
+                    
+                  case 'tool_call_request':
+                    // Execute the tool call
+                    const toolCallRequest = event.value;
+                    const toolResponse = await executeToolCall(
+                      config,
+                      toolCallRequest,
+                      toolRegistry,
+                      undefined // abortSignal
+                    );
+                    
+                    // Send tool call request
+                    writeSSE(res, JSON.stringify({
+                      id: 'chatcmpl-' + Date.now(),
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: 'qwen-code',
+                      choices: [{
+                        index: 0,
+                        delta: { 
+                          tool_calls: [{
+                            id: toolCallRequest.callId,
+                            type: "function",
+                            function: {
+                              name: toolCallRequest.name,
+                              arguments: JSON.stringify(toolCallRequest.args)
+                            }
+                          }]
+                        },
+                        finish_reason: null
+                      }]
+                    }));
+                    
+                    // Send tool call response
+                    writeSSE(res, JSON.stringify({
+                      id: 'chatcmpl-' + Date.now(),
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: 'qwen-code',
+                      choices: [{
+                        index: 0,
+                        delta: { 
+                          content: `[Tool Response: ${toolResponse.resultDisplay || 'Tool executed successfully'}]`
+                        },
+                        finish_reason: null
+                      }]
+                    }));
+                    break;
+                    
+                  case 'error':
+                    writeSSE(res, JSON.stringify({
+                      id: 'chatcmpl-' + Date.now(),
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: 'qwen-code',
+                      choices: [{
+                        index: 0,
+                        delta: { content: `[Error: ${event.value.error.message}]` },
+                        finish_reason: null
+                      }]
+                    }));
+                    break;
                 }
               }
               
@@ -166,6 +229,7 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
               
               // Collect the full response
               let fullResponse = '';
+              let toolCalls: any[] = [];
               const responseStream = await geminiClient.sendMessageStream(
                 [{ text: prompt }],
                 undefined, // abortSignal
@@ -173,8 +237,37 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
               );
               
               for await (const event of responseStream) {
-                if (event.type === 'content') {
-                  fullResponse += event.value;
+                switch (event.type) {
+                  case 'content':
+                    fullResponse += event.value;
+                    break;
+                    
+                  case 'tool_call_request':
+                    // Execute the tool call
+                    const toolCallRequest = event.value;
+                    const toolResponse = await executeToolCall(
+                      config,
+                      toolCallRequest,
+                      toolRegistry,
+                      undefined // abortSignal
+                    );
+                    
+                    toolCalls.push({
+                      id: toolCallRequest.callId,
+                      type: "function",
+                      function: {
+                        name: toolCallRequest.name,
+                        arguments: JSON.stringify(toolCallRequest.args)
+                      }
+                    });
+                    
+                    // Add tool response to the full response
+                    fullResponse += `[Tool Response: ${toolResponse.resultDisplay || 'Tool executed successfully'}]`;
+                    break;
+                    
+                  case 'error':
+                    fullResponse += `[Error: ${event.value.error.message}]`;
+                    break;
                 }
               }
               
@@ -188,7 +281,8 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
                   index: 0,
                   message: {
                     role: 'assistant',
-                    content: fullResponse
+                    content: fullResponse,
+                    tool_calls: toolCalls.length > 0 ? toolCalls : undefined
                   },
                   finish_reason: 'stop'
                 }]
@@ -223,7 +317,7 @@ const server = http.createServer(async (req: IncomingMessage, res: ServerRespons
 
 // Start server
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-server.listen(PORT, () => {
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`Qwen Code SSE HTTP Server running on port ${PORT}`);
   console.log(`Test with: curl -N http://localhost:${PORT}/v1/chat/completions -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"Hello"}]}'`);
 });
